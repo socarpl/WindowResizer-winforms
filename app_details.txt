@@ -1,0 +1,693 @@
+# External Window Resizer — Development Specification
+
+## 1. Objective
+
+Build a Windows 10/11 application in C#/.NET 8 or later that can enumerate top-level windows belonging to other running processes and resize a selected external window to a selected resolution.
+
+The target application does not need to be modified. The implementation must use Win32 window handles (`HWND`) and native Win32 APIs through P/Invoke.
+
+The application must support two resize interpretations:
+
+- **Window** — the selected resolution applies to the complete outer window.
+- **Content Area** — the selected resolution applies to the Win32 client area. The application automatically makes the outer window larger as necessary to accommodate the Windows title bar, borders, and other non-client chrome.
+
+Example: if `800 x 600` is selected and **Content Area** is active, `GetClientRect()` for the target window should end up at exactly `800 x 600`. The complete external window will normally be somewhat larger.
+
+Settings must be saved alongside the app in `application_settings.json`. Save only the resolution list and the selected `Apply resolution to:` radio mode (`Window` or `Content Area`). Do not persist the selected external window, selected resolution, or window filter.
+
+---
+
+## 2. Main UI Concepts
+
+The main window contains at least:
+
+1. A **window list** containing currently detected external top-level windows.
+2. A **resolution list** containing resolutions that can be applied.
+3. The label **`Apply resolution to:`** followed by mutually exclusive radio buttons for the two sizing modes.
+4. A **`Set Resolution`** button with an action/gear icon above its text.
+5. A filter textbox, clear-filter brush icon button, and refresh icon button above the window list.
+6. Icon-only **Add** (plus), **Edit** (pen), and **Delete** (trashcan) buttons for resolutions. Add and Edit use the dialog shown in `002_ResolutionAddEditWindowV2.png`.
+7. A diagnostics log and the existing status bar.
+
+Use `001_MainWindowV2.png` for the main window layout and `002_ResolutionAddEditWindowV2.png` for the resolution dialog layout. Explicit behavioral and icon requirements in this specification take precedence where a mockup still depicts older text buttons or window entry text.
+
+The main window has group boxes titled **`Windows list`**, **`Resolutions`**, and **`Diagnostics`**. The first two contain their respective controls; the Diagnostics group contains the existing read-only multiline log. Keep the status bar below the groups and preserve its current behavior.
+
+---
+
+## 3. Window List
+
+### 3.1 Enumeration
+
+Use `EnumWindows()` to enumerate top-level windows.
+
+For each candidate, obtain as appropriate:
+
+- `IsWindowVisible()`
+- `GetWindowText()` / `GetWindowTextLength()`
+- `GetClassName()`
+- `GetWindowThreadProcessId()`
+- owning process information via `Process.GetProcessById()`
+
+At minimum, exclude:
+
+- invisible windows,
+- windows with no valid owning process,
+- this application's own main window.
+
+The implementation must not assume one process has only one top-level window.
+
+The window list must not contain the same `HWND` more than once. Separate `HWND`s must remain separate entries even when they have the same process name, title (after trimming whitespace), and PID; the displayed HWND distinguishes them. Sort the final list alphabetically by process name (case-insensitive), then by numeric PID; use title and `HWND` as deterministic tie-breakers.
+
+### 3.2 Display format
+
+Where the window title can be fetched, display the entry using this format:
+
+```text
+process_name - Window Title - process_pid - HWND 0xHANDLE
+```
+
+Example:
+
+```text
+notepad - Document.txt - Notepad - 12480 - HWND 0x000C183A
+```
+
+If the window title cannot be fetched, or it is empty/whitespace, display:
+
+```text
+process_name - process_pid - HWND 0xHANDLE
+```
+
+Example:
+
+```text
+notepad - 12480 - HWND 0x000C183A
+```
+
+The final identifier is the retained Win32 `HWND` in hexadecimal, prefixed with `0x` and at least eight digits. It is displayed for identification; internally the selected window must also retain its actual `HWND`, PID, process name, title and class name as available.
+
+Do not identify or later re-find the selected target solely by its window title because titles may change.
+
+### 3.3 Filtering and refresh
+
+Place a filter textbox directly above the window list. When empty and unfocused, it displays the placeholder **`Filter`** in gray. On focus by mouse or Tab, typing starts normal black text; the placeholder is not part of the query. If focus leaves an empty textbox, show the gray placeholder again.
+
+Filter the currently enumerated window entries as the query changes. Keep only rows whose process name or window title contains the query, using case-insensitive substring matching. Do not search PID or HWND text. An empty query shows all enumerated entries. Filtering only changes visibility in the list; it does not delete windows or change the underlying enumeration. If the selected window is hidden by the filter, clear that selection and disable Set Resolution until a visible window is selected.
+
+Place an icon-only brush button next to the textbox with tooltip **`Clear filter`**. Clicking it clears the query and shows all enumerated entries. Place an icon-only refresh button next to this filter section with tooltip **`Refresh window list`**. Refresh re-enumerates external windows and reapplies any active filter.
+
+### 3.4 Selection behavior
+
+The window list is strictly **single-selection**.
+
+- At most one external window may be selected at a time.
+- Selecting another entry automatically deselects the previous entry.
+- Multi-select behavior must be disabled in the UI control.
+- The selected item's `HWND` is the authoritative target for resize and bring-to-front operations.
+
+### 3.5 Double-click behavior
+
+Double-clicking an entry in the window list must attempt to bring that external window to the front.
+
+Expected behavior:
+
+1. Validate the stored handle with `IsWindow(hwnd)`.
+2. If the target is minimized, use `ShowWindow(hwnd, SW_RESTORE)` and verify with `IsIconic()` that it is no longer minimized before requesting foreground activation.
+3. Attempt to activate/bring the window to the foreground using appropriate Win32 APIs, primarily `SetForegroundWindow()` and, where useful, `BringWindowToTop()`.
+4. Do not resize the window as part of this operation.
+
+Windows has foreground-activation restrictions, so a failure to take focus must be handled without crashing. Log/report a meaningful failure where appropriate.
+
+---
+
+## 4. Resolution List
+
+The resolution list contains the resolutions available for application to the selected target window. Users can add, edit, and delete entries. Each item must have a positive integer width and height.
+
+On first launch, before `application_settings.json` exists, populate the list with these default resolutions, starting at 800 x 600 and ending at 4K (3840 x 2160):
+
+```text
+800 x 600
+1024 x 768
+1280 x 720
+1920 x 1080
+1920 x 1200
+2560 x 1440
+3840 x 2160
+```
+
+The resolution list is persisted in `application_settings.json`. On later launches, load the saved list, including an empty list if the user deleted every entry. Do not silently restore defaults when a saved empty list exists.
+
+Sort resolutions by the numeric x value (width) in ascending order. When widths match, sort by numeric y value (height) in ascending order. Apply this order to defaults, loaded settings, added resolutions, and edited resolutions. The saved list must not contain duplicate width/height pairs; normalize older saved lists if necessary.
+
+### 4.1 Resolution management
+
+The resolution list's Add, Edit, and Delete buttons are icon-only: plus, pen, and trashcan respectively. Their tooltips are **`Add resolution`**, **`Edit resolution`**, and **`Delete resolution`**. Edit and Delete are disabled when no resolution is selected.
+
+- **Add** opens the `002_ResolutionAddEditWindowV2.png` dialog with width and height inputs. Saving a valid entry adds it to the resolution list.
+- **Edit** opens the same dialog with the selected resolution's current width and height. Saving valid changes updates that entry.
+- **Delete** removes the selected resolution from the list.
+- **Add** must refuse a width/height pair already in the list. **Edit** must refuse changing an entry to the same width/height pair as another entry. Show a useful validation message while keeping the dialog open.
+- Compare width and height in their entered order: `800 x 600` and `600 x 800` are different resolutions and both are allowed.
+- Edit and Delete require a selected resolution. Canceling the Add/Edit dialog leaves the list unchanged.
+- Reject non-positive or non-integer dimensions and report validation errors in the dialog.
+- Persist changes to the resolution list in `application_settings.json`.
+
+The Add/Edit dialog has a group box titled **`Resolution`** around both numeric inputs and their separator. Make the width and height numeric controls large, with prominently enlarged numerals and usable spin arrows, following the V2 mockup. Keep the existing Cancel and Save actions and validation behavior.
+
+### 4.2 Selection behavior
+
+The resolution list is strictly **single-selection**.
+
+- At most one resolution may be selected at a time.
+- Selecting another resolution automatically deselects the previous resolution.
+- Multi-select behavior must be disabled in the UI control.
+
+### 4.3 Double-click behavior
+
+Double-clicking a resolution must perform exactly the same application command as clicking **`Set Resolution`**.
+
+Do not implement separate resize logic for the double-click handler. Both interactions must call the same command/method so their validation and behavior cannot diverge.
+
+Conceptually:
+
+```text
+Resolution double-click ─┐
+                        ├──> ApplySelectedResolution()
+Set Resolution button ──┘
+```
+
+If no target window is currently selected, double-clicking a resolution cannot perform a resize and must be handled safely. The same applies when the window list is empty or the resolution list is empty. The UI should preferably prevent/disable an unavailable command rather than produce an exception.
+
+---
+
+## 5. `Apply resolution to:` Radio Buttons
+
+The UI contains the exact label:
+
+```text
+Apply resolution to:
+```
+
+Immediately associated with it are two mutually exclusive radio buttons for these sizing modes:
+
+```text
+Window
+Content Area
+```
+
+### 5.1 Default
+
+**`Window` is the default selection on first launch, before saved settings exist.** On later launches, restore the saved `Apply resolution to:` radio selection.
+
+Unless the user changes the radio selection, selecting `800 x 600` and applying the resolution therefore makes the complete outer target window `800 x 600`.
+
+### 5.2 `Window` behavior
+
+When **Window** is selected, the chosen resolution applies to the complete outer window rectangle.
+
+For example:
+
+```text
+Selected resolution: 800 x 600
+Apply resolution to: Window
+```
+
+Target result:
+
+```text
+GetWindowRect width  = 800
+GetWindowRect height = 600
+```
+
+Use `SetWindowPos()` to request the selected width and height for the target HWND.
+
+Use flags such as:
+
+- `SWP_NOMOVE`
+- `SWP_NOZORDER`
+- `SWP_NOACTIVATE`
+
+when appropriate so setting a resolution does not unexpectedly move the target, alter its Z-order, or steal focus.
+
+The target application's actual content/client area will be smaller than the selected resolution because the outer `800 x 600` includes title bar, borders, and other non-client chrome.
+
+### 5.3 `Content Area` behavior
+
+When **Content Area** is selected, the chosen resolution applies to the target's Win32 client area rather than to the complete outer window.
+
+For example:
+
+```text
+Selected resolution: 800 x 600
+Apply resolution to: Content Area
+```
+
+Target result:
+
+```text
+GetClientRect width  = 800
+GetClientRect height = 600
+```
+
+The application must automatically make the complete outer window larger to allow for its title bar, borders and other non-client chrome.
+
+Do not hard-code title-bar or border dimensions. These vary with Windows version, DPI, theme and window style.
+
+Use the target window's measured outer/client difference.
+
+First obtain the current outer size using `GetWindowRect()`:
+
+```text
+currentOuterWidth
+currentOuterHeight
+```
+
+Then obtain its client size using `GetClientRect()`:
+
+```text
+currentClientWidth
+currentClientHeight
+```
+
+For requested client dimensions, calculate:
+
+```text
+newOuterWidth =
+    currentOuterWidth +
+    (requestedClientWidth - currentClientWidth)
+
+newOuterHeight =
+    currentOuterHeight +
+    (requestedClientHeight - currentClientHeight)
+```
+
+Then call `SetWindowPos()` with the calculated outer size.
+
+Example:
+
+```text
+Current outer:      1016 x 689
+Current client:     1000 x 650
+Requested client:    800 x 600
+
+Calculated outer:    816 x 639
+```
+
+The resulting complete window should therefore become approximately `816 x 639`, while its content/client area becomes exactly `800 x 600`.
+
+After resizing, call `GetClientRect()` again and verify the result. If the result differs from the requested size, adjust the outer size by the remaining difference and retry. Limit correction attempts to a small number such as 3; never create an unbounded resize loop.
+
+Important semantic note: **Content Area means the Win32 client area returned by `GetClientRect()`**. Application-owned child UI such as a custom status bar may itself occupy part of this client area and is not generically detectable as separate semantic content.
+
+---
+
+## 6. `Set Resolution` Command
+
+A resolution is applied by clicking the **`Set Resolution`** button when:
+
+1. exactly one window is selected in the window list, and
+2. exactly one resolution is selected in the resolution list.
+
+The command must use the currently selected **`Apply resolution to:`** radio button to decide how to interpret the selected resolution.
+
+The logic is therefore:
+
+```text
+Selected window
+      +
+Selected resolution
+      +
+Apply resolution to
+      |
+      v
+ApplySelectedResolution()
+      |
+      +--> Window       -> resize complete outer window
+      |
+      +--> Content Area -> resize so GetClientRect equals selected resolution
+```
+
+If either the window or the resolution is not selected, or either list is empty, the operation must not run.
+
+Prefer disabling the **`Set Resolution`** button until both required selections exist. Regardless of button enabled state, the underlying command must still validate its inputs defensively.
+
+Before performing a resize:
+
+1. Validate `width > 0` and `height > 0`.
+2. Validate the selected `HWND` using `IsWindow()`.
+3. Restore the target to its normal (neither minimized nor maximized) state before measuring or sizing it. Verify the state with `IsIconic()` and `IsZoomed()`; a minimized window may need a second restore if it first returns to maximized. Stop with a useful error if restoration does not succeed.
+4. Apply the selected resolution according to the selected radio mode.
+5. Verify the resulting relevant dimensions.
+6. Report/log inability to achieve the requested size if the target application enforces its own size restrictions.
+
+---
+
+## 7. Interaction Summary
+
+| User action | Required behavior |
+|---|---|
+| Single-click window | Select that window and deselect any previously selected window |
+| Double-click window | Select it and bring that external window to the front |
+| Single-click resolution | Select that resolution and deselect any previously selected resolution |
+| Double-click resolution | Perform the same command as `Set Resolution` |
+| `Apply resolution to: Window` | Chosen dimensions apply to the complete outer window |
+| `Apply resolution to: Content Area` | Chosen dimensions apply to `GetClientRect()`; enlarge outer window automatically for non-client chrome |
+| Click `Set Resolution` | Apply selected resolution to selected window using the selected mode |
+| Type in Filter | Immediately show only window entries whose process name or title contains the query, case-insensitively |
+| Click brush icon | Clear the filter and show all enumerated windows |
+| Click refresh icon | Re-enumerate external top-level windows and reapply the current filter |
+| Add/Edit resolution | Open the `002_ResolutionAddEditWindowV2.png` dialog and save valid dimensions to the resolution list |
+| Delete resolution | Remove the selected resolution from the list |
+| Empty window or resolution list | Prevent the resize command from running |
+
+---
+
+## 8. DPI Awareness
+
+The application must be DPI aware, preferably Per-Monitor DPI Awareness V2.
+
+This is required because Windows can otherwise virtualize coordinates and sizes at scaling values such as 125%, 150% and 200%.
+
+Do not fix DPI behavior using arbitrary scale factors. Configure appropriate Windows/.NET DPI awareness and ensure that dimensions read from and written to the Win32 APIs use a consistent coordinate system.
+
+Test with multiple monitors and different DPI/scaling values where possible.
+
+---
+
+## 9. Window State and Validity
+
+An `HWND` is not permanent. The target application may close, restart, destroy its top-level window, or replace it with another window.
+
+Validate a retained target with `IsWindow()` before acting on it.
+
+Use appropriate state APIs such as:
+
+- `IsIconic()`
+- `IsZoomed()`
+- `ShowWindow(hwnd, SW_RESTORE)`
+
+when required. Before resizing, a minimized or maximized target must reach normal state; verify this before taking dimensions or calling `SetWindowPos()`. Before bringing a minimized target to the front, verify that it is no longer minimized. Do not interpret `ShowWindow()`'s return value as proof that restoration succeeded.
+
+If the selected target no longer exists, do not crash. Tell the user that the target window is no longer available and allow the window list to be refreshed.
+
+---
+
+## 10. External Window Service
+
+Keep Win32 behavior separate from UI event handlers.
+
+Suggested structure:
+
+```text
+WindowInfo.cs
+ResolutionInfo.cs
+WindowDimensions.cs
+ExternalWindowService.cs
+NativeMethods.cs
+```
+
+Suggested service API:
+
+```csharp
+public sealed class ExternalWindowService
+{
+    public IReadOnlyList<WindowInfo> GetWindows();
+
+    public WindowDimensions GetDimensions(IntPtr hwnd);
+
+    public void BringToFront(IntPtr hwnd);
+
+    public void ResizeOuterWindow(
+        IntPtr hwnd,
+        int width,
+        int height);
+
+    public void ResizeClientArea(
+        IntPtr hwnd,
+        int clientWidth,
+        int clientHeight);
+
+    public void MoveWindow(
+        IntPtr hwnd,
+        int x,
+        int y);
+}
+```
+
+The UI/ViewModel should have one shared application command such as:
+
+```csharp
+ApplySelectedResolution()
+```
+
+Both the **`Set Resolution`** button and a resolution-list double-click must invoke this same command.
+
+---
+
+## 11. Required Win32 APIs
+
+Centralize native declarations in `NativeMethods`.
+
+At minimum, include the required declarations/types/constants for:
+
+- `EnumWindows`
+- `IsWindow`
+- `IsWindowVisible`
+- `GetWindowText`
+- `GetWindowTextLength`
+- `GetClassName`
+- `GetWindowThreadProcessId`
+- `GetWindowRect`
+- `GetClientRect`
+- `SetWindowPos`
+- `IsIconic`
+- `IsZoomed`
+- `ShowWindow`
+- `SetForegroundWindow`
+- `BringWindowToTop`
+
+Create the native `RECT` structure and required constants.
+
+Use `SetLastError = true` where appropriate and convert native failures into useful diagnostics/results.
+
+Do not implement resizing by simulating mouse dragging, keyboard shortcuts or pointer input. The primary resize mechanism is `SetWindowPos()`.
+
+---
+
+## 12. Target-Imposed Restrictions
+
+Some external applications enforce:
+
+- minimum window size,
+- maximum window size,
+- fixed aspect ratio,
+- application-specific sizing rules,
+- custom responses to `WM_SIZE`.
+
+Therefore a successful `SetWindowPos()` request does not guarantee the final dimensions equal the requested dimensions.
+
+Always measure the result after resizing.
+
+When the application cannot achieve the requested result, report actual versus requested dimensions rather than silently claiming success.
+
+Example:
+
+```text
+Requested client size: 800 x 600
+Actual client size:    800 x 584
+
+The target application prevented the requested size.
+```
+
+---
+
+## 13. Permissions
+
+Windows integrity/UIPI restrictions may affect interaction with a process running at a higher privilege level.
+
+Do not automatically elevate this application or attempt to bypass Windows security mechanisms.
+
+If a Win32 operation fails, surface useful diagnostics. Where appropriate indicate that the target application may be running at a different/higher privilege level.
+
+---
+
+## 14. Logging
+
+Display diagnostics in the **`Diagnostics`** group box in the main window. Preserve the existing read-only multiline log behavior and contents.
+
+Add lightweight diagnostics for at least:
+
+```text
+Selected HWND
+Target PID
+Target process name
+Current outer dimensions
+Current client dimensions
+Selected resolution
+Apply resolution to mode
+Calculated outer dimensions
+SetWindowPos result
+Final outer dimensions
+Final client dimensions
+Bring-to-front attempts/results
+```
+
+Example for Content Area mode:
+
+```text
+Target HWND: 0x000C183A
+Target: notepad - 12480
+Current outer: 1016x689
+Current client: 1000x650
+Requested client: 800x600
+Calculated outer: 816x639
+SetWindowPos: success
+Final client: 800x600
+```
+
+---
+
+## 15. Testing
+
+Test at least against several ordinary Windows applications such as Notepad, File Explorer, VLC and another .NET application.
+
+### Selection tests
+
+- Verify only one window can be selected at a time.
+- Verify only one resolution can be selected at a time.
+- Verify selecting another item replaces the prior selection.
+- Verify `Set Resolution` cannot execute without both selections.
+- Verify `Set Resolution` cannot execute when either list is empty.
+
+### Resolution management and settings
+
+- On first launch, verify the seven default resolutions from 800 x 600 through 3840 x 2160 and `Window` mode are shown.
+- Add a resolution through `002_ResolutionAddEditWindowV2.png` and verify it appears in the list and survives restart.
+- Edit a resolution through the same dialog and verify the updated dimensions survive restart.
+- Delete a resolution and verify it remains deleted after restart.
+- Delete every resolution, restart, and verify the list remains empty and resizing is unavailable.
+- Change the `Apply resolution to:` radio selection, restart, and verify that selection is restored.
+- Verify the selected window and selected resolution are not restored from settings.
+- Verify the large numeric inputs remain readable and usable at different DPI scales.
+- Verify adding an existing width/height pair is refused and editing to another entry's pair is refused, while editing an entry without changing its dimensions remains valid.
+- Verify `800 x 600` and `600 x 800` can coexist and that resolutions sort by width, then height, after loading, adding, and editing.
+
+### Window-list double click
+
+- Double-click a normal external window and confirm it is brought to the front.
+- Double-click a minimized window and confirm it is un-minimized before the foreground attempt.
+- Close a selected external window and confirm a later double-click fails safely.
+- Verify a minimized and a maximized window are restored to normal state before resizing. Include a window minimized from maximized state.
+
+### Resolution-list double click
+
+- Select one window and one resolution.
+- Double-click the resolution.
+- Confirm the result is identical to clicking `Set Resolution`.
+- Confirm the same `ApplySelectedResolution()` logic is used for both interactions.
+
+### Window mode
+
+Set:
+
+```text
+Apply resolution to: Window
+Resolution: 800 x 600
+```
+
+Verify the outer rectangle is `800 x 600` subject to restrictions imposed by the target application.
+
+### Content Area mode
+
+Set:
+
+```text
+Apply resolution to: Content Area
+Resolution: 800 x 600
+```
+
+Verify:
+
+```text
+GetClientRect() == 800 x 600
+```
+
+and confirm the complete outer window is larger as necessary for title bar/borders.
+
+Repeat with resolutions including:
+
+```text
+1280 x 720
+1920 x 1080
+1920 x 1200
+```
+
+### Window title fallback
+
+Verify display formatting:
+
+```text
+process_name - Window Title - pid - HWND 0xHANDLE
+```
+
+and, for a window with no retrievable title:
+
+```text
+process_name - pid - HWND 0xHANDLE
+```
+
+Verify the displayed hexadecimal HWND matches the retained handle. Verify the same HWND never appears twice, different HWNDs remain separate even when process/title/PID match, and entries sort by process name (case-insensitive) then numeric PID.
+
+### Main window UI and filter
+
+- Verify the Windows list, Resolutions, and Diagnostics group boxes match the V2 layout and the status bar remains present.
+- Verify gray `Filter` placeholder text is not treated as a query; keyboard and mouse focus allow normal black input.
+- Verify filtering matches process names and window titles case-insensitively, hides nonmatches as the query changes, and does not match only PID or HWND.
+- Verify the brush icon clears the filter and refresh re-enumerates while preserving the current query; check the refresh tooltip.
+- Verify the icon-only Add, Edit, and Delete buttons have their respective tooltips and actions.
+- Verify the Set Resolution button displays an action/gear icon above its text.
+
+### DPI
+
+Test at least 100%, 125% and 150% scaling where possible, including a multi-monitor scenario.
+
+---
+
+## 16. Definition of Done
+
+The feature is complete when all of the following are true:
+
+1. Visible external top-level windows can be enumerated.
+2. Window entries use `process_name - Window Title - process_pid - HWND 0xHANDLE` when a title is available.
+3. Entries fall back to `process_name - process_pid - HWND 0xHANDLE` when a title is unavailable.
+4. The window list permits only one selection.
+5. Double-clicking a window attempts to bring that window to the front.
+6. The resolution list permits only one selection.
+7. Double-clicking a resolution executes the same command as `Set Resolution`.
+8. `Set Resolution` only operates when a window and a resolution are selected.
+9. The UI contains `Apply resolution to:` with two mutually exclusive radio buttons labeled `Window` and `Content Area`.
+10. `Window` is the default value.
+11. `Window` mode applies the selected dimensions to the complete outer window.
+12. `Content Area` mode automatically compensates for title bar/borders so `GetClientRect()` matches the selected resolution.
+13. Content-area compensation is measured dynamically and is not based on hard-coded title-bar/border sizes.
+14. Resize results are measured and verified.
+15. Invalid/closed HWNDs are handled safely.
+16. Minimized/maximized windows are verified as restored to normal state before resizing; minimized windows are verified as un-minimized before foreground activation.
+17. DPI scaling is handled correctly.
+18. Win32 failures are reported meaningfully.
+19. External-window behavior is isolated in a reusable service rather than being embedded in UI handlers.
+20. No resize logic is duplicated between the `Set Resolution` button and resolution double-click handling.
+21. Add, Edit, and Delete manage the resolution list through the supplied dialog for Add/Edit.
+22. The resolution list persists in `application_settings.json`, including an intentionally empty list.
+23. An empty window list or empty resolution list prevents resizing.
+24. The `Apply resolution to:` radio selection persists in `application_settings.json`; no other UI selections are saved.
+25. Duplicate resolutions are rejected by exact ordered width/height pair, while swapped dimensions remain distinct.
+26. Resolutions sort by width, then height, in ascending numeric order.
+27. Duplicate HWNDs are removed from the window list while distinct HWNDs remain visible even when process name, title, and PID match.
+28. Window entries sort alphabetically by process name, then by numeric PID.
+29. The main window follows `001_MainWindowV2.png` with Windows list, Resolutions, and Diagnostics group boxes, while retaining the status bar.
+30. The window filter provides gray placeholder text, case-insensitive process/title filtering, a brush clear button, and a refresh icon with tooltip `Refresh window list`.
+31. Resolution actions use icon-only plus, pen, and trashcan buttons with matching tooltips.
+32. The Set Resolution button shows an action icon above its text; the Add/Edit dialog follows `002_ResolutionAddEditWindowV2.png` with a Resolution group box and large numeric inputs.
